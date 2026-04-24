@@ -21,11 +21,8 @@ COGS = [
 @bot.event
 async def on_ready():
     print(f"✅ Bot connecté en tant que {bot.user}")
-    try:
-        synced = await bot.tree.sync()
-        print(f"✅ {len(synced)} commandes slash synchronisées")
-    except Exception as e:
-        print(f"❌ Erreur sync commandes : {e}")
+    await bot.sync_commands()
+    print("✅ Commandes slash synchronisées")
 
 async def main():
     async with bot:
