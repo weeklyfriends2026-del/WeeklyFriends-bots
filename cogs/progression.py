@@ -1,10 +1,9 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-import asyncio
 import aioftp
-import json
 import re
+from mcrcon import MCRcon
 from utils.database import get_db
 from utils.servers import get_servers
 
@@ -17,9 +16,8 @@ class Progression(commands.Cog):
     def cog_unload(self):
         self.sync_loop.cancel()
 
-    # ── Slash command : lier son compte Minecraft ──────────────────────────────
-    @app_commands.command(name="link", description="Lier ton pseudo Minecraft à ton compte Discord")
-    @app_commands.describe(username="Ton pseudo Minecraft exact")
+    @app_commands.command(name="link", description="Link your Minecraft username to your Discord account")
+    @app_commands.describe(username="Your exact Minecraft username")
     async def link(self, interaction: discord.Interaction, username: str):
         conn = await get_db()
         try:
@@ -30,18 +28,17 @@ class Progression(commands.Cog):
             """, str(interaction.user.id), username)
 
             embed = discord.Embed(
-                title="✅ Compte lié !",
-                description=f"Ton Discord est maintenant lié à **{username}**.",
+                title="✅ Account linked!",
+                description=f"Your Discord is now linked to **{username}**.",
                 color=discord.Color.green()
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
         except Exception as e:
-            await interaction.response.send_message(f"❌ Erreur : {e}", ephemeral=True)
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
         finally:
             await conn.close()
 
-    # ── Slash command : voir sa progression ────────────────────────────────────
-    @app_commands.command(name="progression", description="Voir ta progression sur les serveurs")
+    @app_commands.command(name="progression", description="View your progression on all servers")
     async def progression(self, interaction: discord.Interaction):
         conn = await get_db()
         try:
@@ -51,13 +48,13 @@ class Progression(commands.Cog):
             )
             if not player:
                 await interaction.response.send_message(
-                    "❌ Tu n'as pas encore lié ton compte. Utilise `/link` d'abord !",
+                    "❌ You haven't linked your account yet. Use `/link` first!",
                     ephemeral=True
                 )
                 return
 
             embed = discord.Embed(
-                title=f"📊 Progression de {player['minecraft_username']}",
+                title=f"📊 Progression of {player['minecraft_username']}",
                 color=discord.Color.blurple()
             )
 
@@ -78,7 +75,7 @@ class Progression(commands.Cog):
 
                 embed.add_field(
                     name=f"🌍 {server['name']}",
-                    value=f"✅ Quêtes : **{quests_count}**\n⏱️ Playtime : **{hours}h {minutes}m**",
+                    value=f"✅ Quests: **{quests_count}**\n⏱️ Playtime: **{hours}h {minutes}m**",
                     inline=True
                 )
 
@@ -86,7 +83,6 @@ class Progression(commands.Cog):
         finally:
             await conn.close()
 
-    # ── Tâche automatique : sync toutes les 15 minutes ────────────────────────
     @tasks.loop(minutes=15)
     async def sync_loop(self):
         for server in self.servers:
@@ -97,30 +93,34 @@ class Progression(commands.Cog):
     async def before_sync(self):
         await self.bot.wait_until_ready()
 
-    # ── Sync playtime via RCON ─────────────────────────────────────────────────
     async def sync_playtime(self, server):
         try:
-            from asyncio_rcon import RCONClient
-            async with RCONClient(server["rcon_host"], server["rcon_port"], server["rcon_password"]) as rcon:
-                conn = await get_db()
-                players = await conn.fetch("SELECT * FROM players")
+            conn = await get_db()
+            players = await conn.fetch("SELECT * FROM players")
+            with MCRcon(server["rcon_host"], server["rcon_password"], port=server["rcon_port"]) as rcon:
                 for player in players:
-                    response = await rcon.send(f"minecraft:playtime query {player['minecraft_username']}")
-                    # Parse la réponse RCON (format: "X days, Y hours, Z minutes, W seconds")
-                    match = re.search(r"(\d+)d.*?(\d+)h.*?(\d+)m.*?(\d+)s", response)
-                    if match:
-                        d, h, m, s = map(int, match.groups())
-                        total = d * 86400 + h * 3600 + m * 60 + s
-                        await conn.execute("""
-                            INSERT INTO playtime (player_id, server_name, total_seconds)
-                            VALUES ($1, $2, $3)
-                            ON CONFLICT (player_id, server_name) DO UPDATE SET total_seconds = $3, last_updated = NOW()
-                        """, player["id"], server["name"], total)
-                await conn.close()
-        except Exception as e:
-            print(f"❌ Sync playtime {server['name']} : {e}")
+                    response = rcon.command(f"playtime query {player['minecraft_username']}")
+                    # Format: "X has played for Y days, Z hours, W minutes and V seconds"
+                    days = re.search(r"(\d+) day", response)
+                    hours = re.search(r"(\d+) hour", response)
+                    minutes = re.search(r"(\d+) minute", response)
+                    seconds = re.search(r"(\d+) second", response)
 
-    # ── Sync quêtes via FTP ────────────────────────────────────────────────────
+                    d = int(days.group(1)) if days else 0
+                    h = int(hours.group(1)) if hours else 0
+                    m = int(minutes.group(1)) if minutes else 0
+                    s = int(seconds.group(1)) if seconds else 0
+
+                    total = d * 86400 + h * 3600 + m * 60 + s
+                    await conn.execute("""
+                        INSERT INTO playtime (player_id, server_name, total_seconds)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (player_id, server_name) DO UPDATE SET total_seconds = $3, last_updated = NOW()
+                    """, player["id"], server["name"], total)
+            await conn.close()
+        except Exception as e:
+            print(f"❌ Sync playtime {server['name']}: {e}")
+
     async def sync_quests(self, server):
         try:
             async with aioftp.Client.context(
@@ -128,7 +128,6 @@ class Progression(commands.Cog):
                 user=server["ftp_user"],
                 password=server["ftp_password"]
             ) as ftp_client:
-                # Chemin typique FTB Quests
                 path = "/world/serverconfig/ftbquests/data/"
                 conn = await get_db()
                 players = await conn.fetch("SELECT * FROM players")
@@ -141,7 +140,6 @@ class Progression(commands.Cog):
                             async for block in stream.iter_by_block():
                                 data += block
                         content = data.decode("utf-8")
-                        # Compter les quêtes complétées (claimed: 1)
                         count = content.count("claimed: 1")
                         await conn.execute("""
                             INSERT INTO quest_progress (player_id, server_name, quests_completed)
@@ -149,11 +147,11 @@ class Progression(commands.Cog):
                             ON CONFLICT (player_id, server_name) DO UPDATE SET quests_completed = $3, last_updated = NOW()
                         """, player["id"], server["name"], count)
                     except Exception:
-                        pass  # Joueur pas encore connecté sur ce serveur
+                        pass
 
                 await conn.close()
         except Exception as e:
-            print(f"❌ Sync quêtes {server['name']} : {e}")
+            print(f"❌ Sync quests {server['name']}: {e}")
 
 async def setup(bot):
     await bot.add_cog(Progression(bot))
